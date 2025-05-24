@@ -95,6 +95,7 @@ type ChatCompletionRequest struct {
 	TopP             *float64        `json:"top_p"`
 	ResponseFormat   *ResponseFormat `json:"response_format"`
 	Tools            []api.Tool      `json:"tools"`
+	NumCtx           int             `json:"num_ctx,omitempty"` // Ollama specific, not OpenAI compatible
 }
 
 type ChatCompletion struct {
@@ -131,6 +132,7 @@ type CompletionRequest struct {
 	Temperature      *float32       `json:"temperature"`
 	TopP             float32        `json:"top_p"`
 	Suffix           string         `json:"suffix"`
+	NumCtx           int            `json:"num_ctx,omitempty"` // Ollama specific, not OpenAI compatible
 }
 
 type Completion struct {
@@ -508,6 +510,10 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		options["top_p"] = 1.0
 	}
 
+	if r.NumCtx != 0 {
+		options["num_ctx"] = r.NumCtx
+	}
+
 	var format json.RawMessage
 	if r.ResponseFormat != nil {
 		switch strings.ToLower(strings.TrimSpace(r.ResponseFormat.Type)) {
@@ -561,6 +567,10 @@ func fromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 
 	if r.Seed != nil {
 		options["seed"] = *r.Seed
+	}
+
+	if r.NumCtx != 0 {
+		options["num_ctx"] = r.NumCtx
 	}
 
 	options["frequency_penalty"] = r.FrequencyPenalty

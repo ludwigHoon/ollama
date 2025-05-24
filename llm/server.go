@@ -790,6 +790,8 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/completion", s.port)
 	serverReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, buffer)
+	slog.Info("COMPLETION", "proxied request", serverReq)
+
 	if err != nil {
 		return fmt.Errorf("error creating POST request: %v", err)
 	}
@@ -817,7 +819,7 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 	// keep track of the last token generated, this is used to abort if the model starts looping
 	var lastToken string
 	var tokenRepeat int
-
+	var fullResponse strings.Builder
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -853,12 +855,14 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 			}
 
 			if c.Content != "" {
+				fullResponse.WriteString(c.Content)
 				fn(CompletionResponse{
 					Content: c.Content,
 				})
 			}
 
 			if c.Done {
+				slog.Info("COMPLETION RESPONSE", "content", fullResponse.String(), "done_reason", c.DoneReason, "eval_count", c.EvalCount, "eval_duration", c.EvalDuration, "prompt_eval_count", c.PromptEvalCount, "prompt_eval_duration", c.PromptEvalDuration)
 				fn(c)
 				return nil
 			}

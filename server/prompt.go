@@ -102,3 +102,12 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 
 	return b.String(), images, nil
 }
+
+func tokenizePrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.Options, prompt string) ([]int, error) {
+	tokens, err := tokenize(ctx, prompt)
+	if err != nil {
+		return nil, fmt.Errorf("tokenization failed: %w", err)
+	}
+
+	return tokens, nil
+}

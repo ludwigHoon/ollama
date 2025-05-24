@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1177,6 +1178,9 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	r.POST("/api/chat", s.ChatHandler)
 	r.POST("/api/embed", s.EmbedHandler)
 	r.POST("/api/embeddings", s.EmbeddingsHandler)
+	r.POST("/api/format", s.FormatChatHandler)
+	r.POST("/api/tokenize", s.TokenizeHandler)
+	r.POST("/api/format_and_tokenize", s.FormatAndTokenizeHandler)
 
 	// Inference (OpenAI compatibility)
 	r.POST("/v1/chat/completions", openai.ChatMiddleware(), s.ChatHandler)
@@ -1393,6 +1397,191 @@ func (s *Server) PsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, api.ProcessResponse{Models: models})
 }
 
+func (s *Server) FormatChatHandler(c *gin.Context) {
+
+	var req api.ChatRequest
+	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	} else if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	caps := []model.Capability{model.CapabilityCompletion}
+	if len(req.Tools) > 0 {
+		caps = append(caps, model.CapabilityTools)
+	}
+
+	name := model.ParseName(req.Model)
+	if !name.IsValid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+	name, err := getExistingName(name)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+
+	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	if errors.Is(err, errCapabilityCompletion) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
+		return
+	} else if err != nil {
+		handleScheduleError(c, req.Model, err)
+		return
+	}
+
+	msgs := append(m.Messages, req.Messages...)
+	if req.Messages[0].Role != "system" && m.System != "" {
+		msgs = append([]api.Message{{Role: "system", Content: m.System}}, msgs...)
+	}
+	msgs = filterThinkTags(msgs, m)
+
+	prompt, images, err := chatPrompt(c.Request.Context(), m, r.Tokenize, opts, msgs, req.Tools)
+	if err != nil {
+		slog.Error("chat prompt error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	} else {
+		image_base64 := make([]api.Base64Image, len(images))
+		for i, img := range images {
+			if len(img.Data) > 0 {
+				image_base64[i] = api.Base64Image(base64.StdEncoding.EncodeToString(img.Data))
+			}
+		}
+		c.JSON(http.StatusOK, api.FormatChatResponse{
+			Model:           req.Model,
+			CreatedAt:       time.Now().UTC(),
+			FormattedPrompt: prompt,
+			Images:          image_base64,
+			Done:            true,
+			DoneReason:      "Done",
+		})
+		return
+	}
+}
+
+func (s *Server) TokenizeHandler(c *gin.Context) {
+	var req api.TokenizeRequest
+	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	} else if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	caps := []model.Capability{model.CapabilityCompletion}
+
+	name := model.ParseName(req.Model)
+	if !name.IsValid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+	name, err := getExistingName(name)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+
+	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	if errors.Is(err, errCapabilityCompletion) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
+		return
+	} else if err != nil {
+		handleScheduleError(c, req.Model, err)
+		return
+	}
+	tokens, err := tokenizePrompt(c.Request.Context(), m, r.Tokenize, opts, req.Prompt)
+	if err != nil {
+		slog.Error("tokenize prompt error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, api.TokenizeResponse{
+		Model:       req.Model,
+		CreatedAt:   time.Now().UTC(),
+		Tokens:      tokens,
+		TotalTokens: len(tokens),
+		Done:        true,
+		DoneReason:  "Done",
+	})
+}
+
+func (s *Server) FormatAndTokenizeHandler(c *gin.Context) {
+	var req api.ChatRequest
+	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	} else if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	caps := []model.Capability{model.CapabilityCompletion}
+	if len(req.Tools) > 0 {
+		caps = append(caps, model.CapabilityTools)
+	}
+
+	name := model.ParseName(req.Model)
+	if !name.IsValid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+	name, err := getExistingName(name)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+		return
+	}
+
+	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	if errors.Is(err, errCapabilityCompletion) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
+		return
+	} else if err != nil {
+		handleScheduleError(c, req.Model, err)
+		return
+	}
+
+	msgs := append(m.Messages, req.Messages...)
+	if req.Messages[0].Role != "system" && m.System != "" {
+		msgs = append([]api.Message{{Role: "system", Content: m.System}}, msgs...)
+	}
+	msgs = filterThinkTags(msgs, m)
+
+	prompt, images, err := chatPrompt(c.Request.Context(), m, r.Tokenize, opts, msgs, req.Tools)
+	if err != nil {
+		slog.Error("chat prompt error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	tokens, err := tokenizePrompt(c.Request.Context(), m, r.Tokenize, opts, prompt)
+	if err != nil {
+		slog.Error("tokenize prompt error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	image_base64 := make([]api.Base64Image, len(images))
+	for i, img := range images {
+		if len(img.Data) > 0 {
+			image_base64[i] = api.Base64Image(base64.StdEncoding.EncodeToString(img.Data))
+		}
+	}
+	c.JSON(http.StatusOK, api.FormatAndTokenizeResponse{
+		Model:           req.Model,
+		CreatedAt:       time.Now().UTC(),
+		Tokens:          tokens,
+		FormattedPrompt: prompt,
+		Images:          image_base64,
+		TotalTokens:     len(tokens),
+		Done:            true,
+		DoneReason:      "Done",
+	})
+
+}
+
 func (s *Server) ChatHandler(c *gin.Context) {
 	checkpointStart := time.Now()
 
@@ -1601,7 +1790,7 @@ func handleScheduleError(c *gin.Context, name string, err error) {
 	}
 }
 
-var thinkTagRegexp = regexp.MustCompile(`<think>(?s).*?</think>(\n)*`)
+var thinkTagRegexp = regexp.MustCompile(`<(think|thought)>(?s).*?</(think|thought)>(\n)*`)
 
 func filterThinkTags(msgs []api.Message, m *Model) []api.Message {
 	if m.Config.ModelFamily == "qwen3" || model.ParseName(m.Name).Model == "deepseek-r1" {
